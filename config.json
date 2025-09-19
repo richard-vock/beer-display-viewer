@@ -1,0 +1,8 @@
+{
+    "target-url": "https://beer-display.vercel.app/",
+    "cache-dir": "./cache_site",
+    "port": 8765,
+    "refresh-interval-sec": 5,
+    "user-agent": "OfflineMirror/1.0 (+pywebview)",
+    "preload-paths": []
+}

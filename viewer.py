@@ -3,12 +3,14 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "beautifulsoup4",
+#     "click",
 #     "pywebview",
 #     "requests",
 # ]
 # ///
 
 import hashlib
+import json
 import os
 import queue
 import re
@@ -23,22 +25,12 @@ from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import urljoin, urlparse
 
+import click
 import requests
 from bs4 import BeautifulSoup
 
 os.environ['WEBKIT_DISABLE_DMABUF_RENDERER'] = '1'  # must be set before importing webview
 import webview
-
-# ---------------------------- CONFIG ---------------------------------
-CONFIG = {
-    "TARGET_URL": "https://beer-display.vercel.app/",
-    "CACHE_DIR": Path("cache_site"),
-    "PORT": 8765,
-    "REFRESH_INTERVAL_SEC": 5, #5 * 60,  # 5 minutes
-    "USER_AGENT": "OfflineMirror/1.0 (+pywebview)",
-    "PRELOAD_PATHS": [],
-}
-# ---------------------------------------------------------------------
 
 CSS_URL_RE = re.compile(r"url\(([^)]+)\)")
 
@@ -48,14 +40,13 @@ class SnapshotResult:
     html_path: Path
 
 class SilentHTTPRequestHandler(SimpleHTTPRequestHandler):
-    # Serve from CONFIG["CACHE_DIR"] without noisy logs
     def log_message(self, format, *args):
         pass
 
 
-def _requests_session() -> requests.Session:
+def _requests_session(user_agent: str) -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": CONFIG["USER_AGENT"]})
+    s.headers.update({"User-Agent": user_agent})
     s.timeout = 20
     return s
 
@@ -169,10 +160,10 @@ def compute_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def fetch_snapshot(cache_root: Path, target_url: str, extra_paths: Iterable[str]) -> SnapshotResult:
+def fetch_snapshot(cache_root: Path, target_url: str, user_agent: str, extra_paths: Iterable[str]) -> SnapshotResult:
     """Fetch target_url and assets into cache_root. Returns whether it changed."""
     cache_root.mkdir(parents=True, exist_ok=True)
-    session = _requests_session()
+    session = _requests_session(user_agent)
 
     print(f"refreshing snapshot from {target_url} to {cache_root}")
     index_path = cache_root / "index.html"
@@ -228,11 +219,13 @@ def fetch_snapshot(cache_root: Path, target_url: str, extra_paths: Iterable[str]
 
 # ---------------------------- THREADS --------------------------------
 class RefetchThread(threading.Thread):
-    def __init__(self, cache_root: Path, target_url: str, interval: int, reload_q: queue.Queue):
+    def __init__(self, cache_root: Path, target_url: str, interval: int, preload_paths: list[Path], user_agent: str, reload_q: queue.Queue):
         super().__init__(daemon=True)
         self.cache_root = cache_root
         self.target_url = target_url
-        self.interval = max(30, int(interval))  # safety minimum
+        self.interval = max(10, int(interval))
+        self.preload_paths = preload_paths
+        self.user_agent = user_agent
         self.reload_q = reload_q
         self._stop = threading.Event()
 
@@ -242,7 +235,7 @@ class RefetchThread(threading.Thread):
     def run(self):
         while not self._stop.is_set():
             try:
-                res = fetch_snapshot(self.cache_root, self.target_url, CONFIG["PRELOAD_PATHS"])
+                res = fetch_snapshot(self.cache_root, self.target_url, self.user_agent, self.preload_paths)
                 if res.changed:
                     self.reload_q.put("reload")
             except Exception:
@@ -289,48 +282,72 @@ def start_http_server(doc_root: Path, port: int) -> ThreadingHTTPServer:
     return server
 
 
-def ensure_initial_cache(cache_root: Path, target_url: str) -> Path:
-    """Try to fetch once; if offline, ensure an index.html exists."""
+def ensure_initial_cache(cfg: any) -> Path:
+    cache_root = Path(cfg["cache-dir"]).resolve()
+    target_url = cfg["target-url"]
+
     try:
-        res = fetch_snapshot(cache_root, target_url, CONFIG["PRELOAD_PATHS"])
+        res = fetch_snapshot(cache_root, target_url, cfg["user-agent"], cfg["preload-paths"])
         return res.html_path
     except Exception:
         # Offline: create a minimal placeholder if nothing exists
         index = cache_root / "index.html"
         cache_root.mkdir(parents=True, exist_ok=True)
+        backup_index = "./assets/backup.html"
+        backup_css = "./assets/backup.css"
+        shutil.copy(backup_index, index) if Path(backup_index).exists() else None
+        shutil.copy(backup_css, cache_root / "backup.css") if Path(backup_css).exists() else None
         if not index.exists():
             index.write_text(
-                """
+                f"""
                 <!doctype html>
                 <meta charset=\"utf-8\">
                 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
                 <title>Offline</title>
-                <style>body{font-family:system-ui,Arial;margin:2rem;} .badge{display:inline-block;padding:.25rem .5rem;border:1px solid #999;border-radius:.5rem;}
-                .muted{color:#555}</style>
+                <style>body{{font-family:system-ui,Arial;margin:2rem;}} .badge{{display:inline-block;padding:.25rem .5rem;border:1px solid #999;border-radius:.5rem;}}
+                .muted{{color:#555}}</style>
                 <h1>Offline snapshot not yet available</h1>
-                <p class=\"muted\">I'll keep trying to fetch <code>{}</code> whenever there's a connection.</p>
+                <p class=\"muted\">I'll keep trying to fetch <code>{target_url}</code> whenever there's a connection.</p>
                 <p><span class=\"badge\">Status</span> waiting for first successful sync…</p>
-                """.format(target_url),
+                """,
                 encoding="utf-8",
             )
         return index
 
 
-def main():
-    target_url = CONFIG["TARGET_URL"]
-    cache_root: Path = CONFIG["CACHE_DIR"]
-    port = CONFIG["PORT"]
+@click.command()
+@click.option("--config", "-c", type=str, default="./config.json", help="Path to config file")
+def main(config: str | Path):
+    config = Path(config)
+    if not config.exists():
+        print(f"Config file {config} not found. Aborting.")
+        sys.exit(1)
+
+    cfg = dict()
+    with open(config, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    target_url = cfg["target-url"]
+    cache_root: Path = Path(cfg["cache-dir"])
+    port = cfg["port"]
 
     abs_cache_root = cache_root.resolve()
 
-    index_path = ensure_initial_cache(abs_cache_root, target_url)
+    index_path = ensure_initial_cache(cfg)
 
     server = start_http_server(abs_cache_root, port)
     start_url = f"http://127.0.0.1:{port}/{index_path.name}"
     window = webview.create_window("Offline Mirror", url=start_url)
 
     reload_q: queue.Queue = queue.Queue()
-    refetcher = RefetchThread(abs_cache_root, target_url, CONFIG["REFRESH_INTERVAL_SEC"], reload_q)
+    refetcher = RefetchThread(
+        abs_cache_root,
+        target_url,
+        cfg["refresh-interval-sec"],
+        [Path(p) for p in cfg["preload-paths"]],
+        cfg["user-agent"],
+        reload_q,
+    )
     watcher = ReloadWatcher(window, reload_q)
 
     refetcher.start()
