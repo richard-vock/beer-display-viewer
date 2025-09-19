@@ -355,6 +355,7 @@ def main(config: str | Path):
 
     try:
         webview.start()
+        window.toggle_fullscreen()
     finally:
         refetcher.stop()
         watcher.stop()
